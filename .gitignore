@@ -1,0 +1,7 @@
+/target
+Cargo.lock
+*.log
+*.log.*
+.direnv
+.env
+xingdu
