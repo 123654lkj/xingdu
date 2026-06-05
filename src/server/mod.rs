@@ -335,8 +335,28 @@ async fn handle_chat_completions(
             if let Some(ref b) = state.breaker_mw {
                 b.record_failure(&backend.name).await;
             }
-            let err = serde_json::json!({"error":{"message":e.to_string(),"type":"server_error"}});
-            (StatusCode::BAD_GATEWAY, Json(err)).into_response()
+            // 尝试解析 client 返回的 OpenAI 格式错误
+            let err_str = e.to_string();
+            let err_json = if let Ok(val) = serde_json::from_str::<serde_json::Value>(&err_str) {
+                val
+            } else {
+                serde_json::json!({"error":{"message":err_str,"type":"server_error"}})
+            };
+            // 提取 HTTP 状态码
+            let status_code = err_json.get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(|c| c.as_u64())
+                .map(|c| match c {
+                    400 => StatusCode::BAD_REQUEST,
+                    401 => StatusCode::UNAUTHORIZED,
+                    403 => StatusCode::FORBIDDEN,
+                    404 => StatusCode::NOT_FOUND,
+                    429 => StatusCode::TOO_MANY_REQUESTS,
+                    500..=599 => StatusCode::BAD_GATEWAY,
+                    _ => StatusCode::BAD_GATEWAY,
+                })
+                .unwrap_or(StatusCode::BAD_GATEWAY);
+            (status_code, Json(err_json)).into_response()
         }
     }
 }
