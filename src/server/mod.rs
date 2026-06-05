@@ -17,6 +17,7 @@ use crate::adapter::{self, BackendConfig, Protocol};
 use crate::types::*;
 use crate::metrics::MetricsCollector;
 use crate::middleware::cache::ResponseCacheMiddleware;
+use crate::middleware::semantic_cache::SemanticCacheMiddleware;
 use crate::middleware::circuit_breaker::CircuitBreakerMiddleware;
 use crate::security;
 
@@ -26,6 +27,7 @@ pub struct AppState {
     pub client: HttpClient,
     pub metrics: Arc<MetricsCollector>,
     pub cache_mw: Option<Arc<ResponseCacheMiddleware>>,
+    pub semantic_cache: Option<Arc<SemanticCacheMiddleware>>,
     pub breaker_mw: Option<Arc<CircuitBreakerMiddleware>>,
 }
 
@@ -33,6 +35,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     Router::new()
         // OpenAI 兼容
         .route("/v1/chat/completions", post(handle_chat_completions))
+        .route("/v1/compare", post(handle_compare))
         .route("/v1/models", get(list_models))
         .route("/chat/completions", post(handle_chat_completions))
         .route("/models", get(list_models))
@@ -49,6 +52,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         // 内部
         .route("/health", get(health))
         .route("/stats", get(stats_handler))
+        .route("/semantic-cache/stats", get(semantic_cache_stats))
         .with_state(state)
 }
 
@@ -240,6 +244,20 @@ async fn handle_chat_completions(
         }
     }
 
+    // 语义缓存：embedding 相似度匹配
+    {
+        let sem_cache = &state.semantic_cache;
+        if let Some(ref sc) = sem_cache {
+            if let Some(cached) = sc.get(&request).await {
+                state.metrics.record_cache(true);
+                if let Ok(resp) = serde_json::from_value::<OpenAIResponse>(cached) {
+                    tracing::info!("semantic cache HIT, returning");
+                    return Json(resp).into_response();
+                }
+            }
+        }
+    }
+
     // 上下文控制：截断旧消息保留最新 N 条
     let max_msgs = state.config.read().await.max_messages;
     if req_ctx.request.messages.len() > max_msgs {
@@ -348,6 +366,13 @@ async fn handle_chat_completions(
             if let Some(ref c) = state.cache_mw {
                 if let Some(ref raw) = resp_ctx.raw_response {
                     c.set_with_prefix(&cache_key, &request, raw.clone()).await;
+                }
+            }
+
+            // 写入语义缓存
+            if let Some(ref sc) = state.semantic_cache {
+                if let Some(ref raw) = resp_ctx.raw_response {
+                    sc.set(&request, raw.clone()).await;
                 }
             }
 
@@ -525,6 +550,14 @@ async fn stats_handler(State(state): State<Arc<AppState>>) -> Json<serde_json::V
     Json((*state.metrics).snapshot())
 }
 
+async fn semantic_cache_stats(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    if let Some(ref sc) = state.semantic_cache {
+        Json(sc.stats().await)
+    } else {
+        Json(serde_json::json!({"enabled": false}))
+    }
+}
+
 async fn ollama_show(
     State(_state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
@@ -574,4 +607,159 @@ fn compute_cost(model: &str, tokens_in: u64, tokens_out: u64) -> f64 {
     let input_cost = tokens_in as f64 * input_price / 1_000_000.0;
     let output_cost = tokens_out as f64 * output_price / 1_000_000.0;
     input_cost + output_cost
+}
+
+/// 模型擂台：并行对比多个模型回答
+async fn handle_compare(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<OpenAIRequest>,
+) -> impl IntoResponse {
+    let req_id = uuid::Uuid::new_v4().to_string();
+    let span = tracing::info_span!("compare", req_id = %req_id);
+    let _enter = span.enter();
+
+    // 认证
+    {
+        let cfg = state.config.read().await;
+        if cfg.auth_enabled && !cfg.api_keys.is_empty() {
+            let token = security::extract_bearer_token(&headers);
+            match token {
+                Some(t) if security::verify_api_key(&cfg.api_keys.iter().cloned().collect(), &t) => {}
+                _ => {
+                    let err = serde_json::json!({"error":{"message":"Unauthorized","type":"auth_error"}});
+                    return (StatusCode::UNAUTHORIZED, Json(err)).into_response();
+                }
+            }
+        }
+    }
+
+    // 从请求头 X-Compare-Models 读取要对比的模型列表
+    let models = headers.get("x-compare-models")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(',').map(|m| m.trim().to_string()).collect::<Vec<_>>())
+        .unwrap_or_else(|| vec![
+            "qwen3.6-plus".to_string(),
+            "deepseek-chat".to_string(),
+        ]);
+
+    if models.is_empty() {
+        let err = serde_json::json!({"error":{"message":"No models specified","type":"invalid_request"}});
+        return (StatusCode::BAD_REQUEST, Json(err)).into_response();
+    }
+
+    tracing::info!(models = ?models, "compare request");
+
+    // 并行发请求
+    let mut tasks = Vec::new();
+    let protocol_override = headers.get("x-protocol")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    for model in &models {
+        let state = state.clone();
+        let model = model.clone();
+        let mut req = request.clone();
+        req.model = model.clone();
+        req.stream = Some(false);
+        let proto = protocol_override.clone();
+
+        let task = tokio::spawn(async move {
+            let start = std::time::Instant::now();
+
+            let (mut backend, adapter) = select_backend_by_model(&model, proto.as_deref(), &req);
+
+            let mut req_ctx = RequestContext::new(req.clone(), state.config.clone());
+            state.pipeline.execute_request(&mut req_ctx).await;
+
+            let backend_req = build_backend_request(&req_ctx);
+            backend.model = req_ctx.selected_model.clone();
+
+            match state.client.send_request(&backend, adapter, &backend_req).await {
+                Ok(mut resp) => {
+                    let latency = start.elapsed().as_millis() as u64;
+                    let tokens_in = resp.usage.as_ref().map(|u| u.prompt_tokens as u64).unwrap_or(0);
+                    let tokens_out = resp.usage.as_ref().map(|u| u.completion_tokens as u64).unwrap_or(0);
+                    let cost = compute_cost(&resp.model, tokens_in, tokens_out);
+                    state.metrics.record_request(&resp.model, tokens_in, tokens_out, cost, latency);
+
+                    let content = resp.choices.first()
+                        .and_then(|c| c.message.content.as_ref())
+                        .cloned()
+                        .unwrap_or_default();
+
+                    serde_json::json!({
+                        "model": resp.model,
+                        "content": content,
+                        "latency_ms": latency,
+                        "cost_yuan": cost,
+                        "tokens_input": tokens_in,
+                        "tokens_output": tokens_out,
+                        "success": true,
+                        "error": null,
+                    })
+                }
+                Err(e) => {
+                    state.metrics.record_error();
+                    serde_json::json!({
+                        "model": model,
+                        "content": null,
+                        "latency_ms": start.elapsed().as_millis() as u64,
+                        "cost_yuan": 0.0,
+                        "tokens_input": 0,
+                        "tokens_output": 0,
+                        "success": false,
+                        "error": e.to_string(),
+                    })
+                }
+            }
+        });
+        tasks.push(task);
+    }
+
+    // 收集结果
+    let mut results = Vec::new();
+    let mut total_cost = 0.0;
+    let mut fastest_ms: u64 = u64::MAX;
+    let mut fastest_model = String::new();
+    let mut cheapest_yuan: f64 = f64::MAX;
+    let mut cheapest_model = String::new();
+
+    for task in tasks {
+        if let Ok(result) = task.await {
+            if let Some(latency) = result.get("latency_ms").and_then(|v| v.as_u64()) {
+                if let Some(model) = result.get("model").and_then(|v| v.as_str()) {
+                    if latency < fastest_ms {
+                        fastest_ms = latency;
+                        fastest_model = model.to_string();
+                    }
+                }
+            }
+            if let Some(cost) = result.get("cost_yuan").and_then(|v| v.as_f64()) {
+                if let Some(model) = result.get("model").and_then(|v| v.as_str()) {
+                    total_cost += cost;
+                    if cost < cheapest_yuan {
+                        cheapest_yuan = cost;
+                        cheapest_model = model.to_string();
+                    }
+                }
+            }
+            results.push(result);
+        }
+    }
+
+    let summary = serde_json::json!({
+        "total_cost": total_cost,
+        "fastest": fastest_model,
+        "fastest_ms": if fastest_ms == u64::MAX { 0 } else { fastest_ms },
+        "cheapest": cheapest_model,
+        "cheapest_yuan": if cheapest_yuan == f64::MAX { 0.0 } else { cheapest_yuan },
+        "model_count": models.len(),
+        "success_count": results.iter().filter(|r| r.get("success").and_then(|v| v.as_bool()).unwrap_or(false)).count(),
+    });
+
+    Json(serde_json::json!({
+        "results": results,
+        "summary": summary,
+    })).into_response()
 }

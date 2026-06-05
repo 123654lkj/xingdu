@@ -1,5 +1,6 @@
 pub mod headroom;
 pub mod cache;
+pub mod semantic_cache;
 pub mod cost_routing;
 pub mod fallback;
 pub mod circuit_breaker;

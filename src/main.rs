@@ -91,12 +91,26 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("pipeline initialized with {} middlewares", pipeline.len());
 
     let client = client::HttpClient::new()?;
+    let semantic_cache_enabled = std::env::var("XINGDU_SEMANTIC_CACHE")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
+    let semantic_cache = if semantic_cache_enabled {
+        let ttl = std::env::var("XINGDU_SEMANTIC_CACHE_TTL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3600);
+        Some(Arc::new(middleware::semantic_cache::SemanticCacheMiddleware::new(true, ttl)))
+    } else {
+        None
+    };
+
     let state = Arc::new(server::AppState {
         config: config.clone(),
         pipeline,
         client,
         metrics: metrics.clone(),
         cache_mw,
+        semantic_cache,
         breaker_mw,
     });
 
