@@ -364,28 +364,70 @@ async fn handle_chat_completions(
             if let Some(ref b) = state.breaker_mw {
                 b.record_failure(&backend.name).await;
             }
-            // 尝试解析 client 返回的 OpenAI 格式错误
+            
+            // Fallback: 主模型失败时尝试备用模型
             let err_str = e.to_string();
             let err_json = if let Ok(val) = serde_json::from_str::<serde_json::Value>(&err_str) {
                 val
             } else {
                 serde_json::json!({"error":{"message":err_str,"type":"server_error"}})
             };
-            // 提取 HTTP 状态码
+            
             let status_code = err_json.get("error")
                 .and_then(|e| e.get("code"))
                 .and_then(|c| c.as_u64())
-                .map(|c| match c {
-                    400 => StatusCode::BAD_REQUEST,
-                    401 => StatusCode::UNAUTHORIZED,
-                    403 => StatusCode::FORBIDDEN,
-                    404 => StatusCode::NOT_FOUND,
-                    429 => StatusCode::TOO_MANY_REQUESTS,
-                    500..=599 => StatusCode::BAD_GATEWAY,
-                    _ => StatusCode::BAD_GATEWAY,
-                })
-                .unwrap_or(StatusCode::BAD_GATEWAY);
-            (status_code, Json(err_json)).into_response()
+                .unwrap_or(500);
+            
+            // 只有 429/5xx 才触发 fallback
+            let should_fallback = status_code == 429 || (500..=599).contains(&status_code);
+            
+            if should_fallback {
+                // 定义 fallback 链：同平台不同模型
+                let fallback_chain = match backend.name.as_str() {
+                    "bailian" => vec!["qwen3.5-plus", "qwen3.6-plus"],
+                    "deepseek" => vec!["deepseek-chat", "deepseek-v4-flash"],
+                    "zhipu" => vec!["glm-4", "glm-5.1"],
+                    "minimax" => vec!["MiniMax-M2.5", "MiniMax-M3"],
+                    _ => vec![],
+                };
+                
+                for fallback_model in fallback_chain {
+                    if fallback_model == backend_req.model.as_str() {
+                        continue;
+                    }
+                    tracing::info!("fallback: trying model={}", fallback_model);
+                    
+                    let (mut fb_backend, fb_adapter) = select_backend_by_model(fallback_model, None, &req_ctx.request);
+                    let mut fb_req = backend_req.clone();
+                    fb_req.model = fallback_model.to_string();
+                    
+                    match state.client.send_request(&fb_backend, fb_adapter, &fb_req).await {
+                        Ok(mut resp) => {
+                            tracing::info!("fallback: success model={}", fallback_model);
+                            state.metrics.record_request(&resp.model, 0, 0, 0.0, 0);
+                            if let Some(ref b) = state.breaker_mw {
+                                b.record_success(&fb_backend.name).await;
+                            }
+                            return Json(resp).into_response();
+                        }
+                        Err(_) => {
+                            tracing::warn!("fallback: failed model={}", fallback_model);
+                            continue;
+                        }
+                    }
+                }
+            }
+            
+            let http_status = match status_code {
+                400 => StatusCode::BAD_REQUEST,
+                401 => StatusCode::UNAUTHORIZED,
+                403 => StatusCode::FORBIDDEN,
+                404 => StatusCode::NOT_FOUND,
+                429 => StatusCode::TOO_MANY_REQUESTS,
+                500..=599 => StatusCode::BAD_GATEWAY,
+                _ => StatusCode::BAD_GATEWAY,
+            };
+            (http_status, Json(err_json)).into_response()
         }
     }
 }
