@@ -240,6 +240,35 @@ async fn handle_chat_completions(
         }
     }
 
+    // 上下文控制：截断旧消息保留最新 N 条
+    let max_msgs = state.config.read().await.max_messages;
+    if req_ctx.request.messages.len() > max_msgs {
+        let system_msgs: Vec<Message> = req_ctx.request.messages.iter()
+            .filter(|m| m.role == "system")
+            .cloned()
+            .collect();
+        let non_system: Vec<Message> = req_ctx.request.messages.iter()
+            .filter(|m| m.role != "system")
+            .cloned()
+            .collect();
+        
+        let keep_count = max_msgs.saturating_sub(system_msgs.len());
+        let start = non_system.len().saturating_sub(keep_count);
+        let kept_non_system = &non_system[start..];
+        
+        let mut truncated = system_msgs;
+        truncated.extend_from_slice(kept_non_system);
+        
+        tracing::info!(
+            original = req_ctx.request.messages.len(),
+            truncated = truncated.len(),
+            max_messages = max_msgs,
+            "messages truncated"
+        );
+        
+        req_ctx.request.messages = truncated;
+    }
+
     let backend_req = build_backend_request(&req_ctx);
     backend.model = req_ctx.selected_model.clone();
 
