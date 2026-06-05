@@ -216,12 +216,41 @@ impl Adapter for AnthropicAdapter {
 
         if evt_type == "content_block_delta" {
             let delta = evt.get("delta")?;
-            // Skip thinking blocks and input_json blocks entirely
             let delta_type = delta.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            if delta_type == "thinking_delta" || delta_type == "input_json_delta" {
-                return None;
+            if delta_type == "thinking_delta" {
+                // Pass through thinking as reasoning_content
+                let thinking = delta.get("thinking").and_then(|v| v.as_str())?;
+                return Some(OpenAIStreamChunk {
+                    id: "chatcmpl-proxy".into(),
+                    object: "chat.completion.chunk".into(),
+                    created: chrono::Utc::now().timestamp(),
+                    model: model.to_string(),
+                    choices: vec![StreamChoice {
+                        index: 0,
+                        delta: Delta { role: None, content: Some(thinking.to_string()) },
+                        finish_reason: None,
+                    }],
+                });
             }
-            let text = delta.get("text").or_else(|| delta.get("partial_json")).and_then(|v| v.as_str())?;
+            if delta_type == "input_json_delta" {
+                // Tool call arguments streaming
+                let partial = delta.get("partial_json").and_then(|v| v.as_str())?;
+                return Some(OpenAIStreamChunk {
+                    id: "chatcmpl-proxy".into(),
+                    object: "chat.completion.chunk".into(),
+                    created: chrono::Utc::now().timestamp(),
+                    model: model.to_string(),
+                    choices: vec![StreamChoice {
+                        index: 0,
+                        delta: Delta {
+                            role: None,
+                            content: Some(format!("[tool_args:{}]", partial)),
+                        },
+                        finish_reason: None,
+                    }],
+                });
+            }
+            let text = delta.get("text").and_then(|v| v.as_str())?;
             Some(OpenAIStreamChunk {
                 id: "chatcmpl-proxy".into(),
                 object: "chat.completion.chunk".into(),
@@ -233,6 +262,30 @@ impl Adapter for AnthropicAdapter {
                     finish_reason: None,
                 }],
             })
+        } else if evt_type == "content_block_start" {
+            let cb = evt.get("content_block")?;
+            let cbt = cb.get("type")?.as_str()?;
+            if cbt == "tool_use" {
+                // Tool call start
+                let name = cb.get("name")?.as_str()?;
+                let id = cb.get("id")?.as_str()?;
+                return Some(OpenAIStreamChunk {
+                    id: "chatcmpl-proxy".into(),
+                    object: "chat.completion.chunk".into(),
+                    created: chrono::Utc::now().timestamp(),
+                    model: model.to_string(),
+                    choices: vec![StreamChoice {
+                        index: 0,
+                        delta: Delta {
+                            role: None,
+                            content: Some(format!("[tool_start:{}:{}]", id, name)),
+                        },
+                        finish_reason: None,
+                    }],
+                });
+            }
+            // thinking block start — skip
+            None
         } else if evt_type == "message_stop" {
             Some(OpenAIStreamChunk {
                 id: "chatcmpl-proxy".into(),
