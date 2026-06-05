@@ -395,8 +395,58 @@ async fn list_models() -> Json<serde_json::Value> {
     }))
 }
 
-async fn health() -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "status": "ok" }))
+async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    // 检查各后端健康状态
+    let backends = vec![
+        ("bailian", "https://coding.dashscope.aliyuncs.com/apps/anthropic/v1/messages"),
+        ("deepseek", "https://api.deepseek.com/v1/chat/completions"),
+        ("zhipu", "https://open.bigmodel.cn/api/anthropic/v1/messages"),
+        ("minimax", "https://api.minimaxi.com/v1/chat/completions"),
+    ];
+    
+    let mut backend_status = serde_json::Map::new();
+    for (name, url) in backends {
+        let healthy = check_backend_health(url, "***").await;
+        backend_status.insert(name.to_string(), serde_json::json!({
+            "url": url,
+            "healthy": healthy,
+        }));
+    }
+    
+    // 熔断器状态
+    let breaker_status = if let Some(ref breaker) = state.breaker_mw {
+        serde_json::json!({"enabled": true})
+    } else {
+        serde_json::json!({"enabled": false})
+    };
+    
+    Json(serde_json::json!({
+        "status": "ok",
+        "backends": backend_status,
+        "circuit_breaker": breaker_status,
+    }))
+}
+
+/// 简单健康检查：GET 请求后端，带 minimal payload
+async fn check_backend_health(url: &str, api_key: &str) -> bool {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build();
+    if let Ok(client) = client {
+        let mut req = client.get(url).build().unwrap();
+        // 添加认证头
+        req.headers_mut().insert(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {}", api_key).parse().unwrap(),
+        );
+        if let Ok(resp) = client.execute(req).await {
+            return resp.status().is_success() 
+                || resp.status().as_u16() == 404 
+                || resp.status().as_u16() == 405;
+            // 405 Method Not Allowed 也算通（端点存在只是不支持 GET）
+        }
+    }
+    false
 }
 
 async fn stats_handler(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
