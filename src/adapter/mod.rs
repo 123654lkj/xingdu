@@ -153,12 +153,18 @@ impl Adapter for AnthropicAdapter {
             .map_err(|e| AdapterError::Serialization(format!("Anthropic parse error: {}", e)))?;
 
         let mut content = String::new();
+        let mut thinking_content = String::new();
         let mut tool_calls = Vec::new();
         for block in &ar.content {
             match block.block_type.as_str() {
                 "text" => {
                     if let Some(ref text) = block.text {
                         content.push_str(text);
+                    }
+                }
+                "thinking" => {
+                    if let Some(ref thinking) = block.thinking {
+                        thinking_content.push_str(thinking);
                     }
                 }
                 "tool_use" => {
@@ -177,6 +183,15 @@ impl Adapter for AnthropicAdapter {
             }
         }
 
+        // 如果 content 为空但有 thinking，把 thinking 合并到 content
+        let final_content = if content.is_empty() && !thinking_content.is_empty() {
+            thinking_content
+        } else if !thinking_content.is_empty() {
+            format!("{}\n{}", content, thinking_content)
+        } else {
+            content
+        };
+
         let finish_reason = match ar.stop_reason.as_deref() {
             Some("end_turn" | "stop_sequence") => Some("stop".to_string()),
             Some("max_tokens") => Some("length".to_string()),
@@ -186,7 +201,7 @@ impl Adapter for AnthropicAdapter {
 
         let message = ResponseMessage {
             role: "assistant".into(),
-            content: if content.is_empty() { None } else { Some(content) },
+            content: if final_content.is_empty() { None } else { Some(final_content) },
             tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
         };
 
