@@ -149,3 +149,12 @@
 2. **统一thinking处理**: Anthropic和OpenAI adapter都合并thinking到content
 3. **错误码映射**: 后端错误码统一映射为OpenAI格式
 4. **监控告警**: 添加后端健康检查，失败自动切换
+
+## 缓存测试
+
+| 测试项 | 结果 |
+|--------|------|
+| 缓存开启 | ✅ XINGDU_RESP_CACHE=1 |
+| exact cache HIT | ✅ 相同请求直接返回 |
+| 缓存节省 | 重复请求省 100% token |
+
