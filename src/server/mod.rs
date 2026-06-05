@@ -332,7 +332,8 @@ async fn handle_chat_completions(
             let latency = start.elapsed().as_millis() as u64;
             let tokens_in = resp.usage.as_ref().map(|u| u.prompt_tokens as u64).unwrap_or(0);
             let tokens_out = resp.usage.as_ref().map(|u| u.completion_tokens as u64).unwrap_or(0);
-            state.metrics.record_request(&resp.model, tokens_in, tokens_out, 0.0, latency);
+            let cost = compute_cost(&resp.model, tokens_in, tokens_out);
+            state.metrics.record_request(&resp.model, tokens_in, tokens_out, cost, latency);
 
             if let Some(ref b) = state.breaker_mw {
                 b.record_success(&backend.name).await;
@@ -556,4 +557,21 @@ async fn generic_ok() -> Json<serde_json::Value> {
 
 async fn version_handler() -> Json<serde_json::Value> {
     Json(serde_json::json!({"version": "0.1.0"}))
+}
+
+/// 计算请求成本（人民币元）
+fn compute_cost(model: &str, tokens_in: u64, tokens_out: u64) -> f64 {
+    // 单价：元/百万token
+    let (input_price, output_price) = match model {
+        m if m.starts_with("qwen") => (2.0, 6.0),
+        m if m.starts_with("deepseek") => (1.0, 2.0),
+        m if m.starts_with("glm") => (5.0, 5.0),
+        m if m.starts_with("MiniMax") => (10.0, 10.0),
+        m if m.starts_with("kimi") => (12.0, 60.0),
+        _ => (5.0, 5.0),
+    };
+    
+    let input_cost = tokens_in as f64 * input_price / 1_000_000.0;
+    let output_cost = tokens_out as f64 * output_price / 1_000_000.0;
+    input_cost + output_cost
 }
