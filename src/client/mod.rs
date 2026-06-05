@@ -52,6 +52,8 @@ impl HttpClient {
     ) -> anyhow::Result<reqwest::Response> {
         let payload = adapter.request_to_backend(request, backend)?;
         let body_str = serde_json::to_string(&payload)?;
+        tracing::info!("xingdu stream sending to {}: {}", backend.url, body_str);
+        tracing::info!("xingdu stream headers: protocol={:?}, api_key=***", backend.protocol);
         let hdrs = self.build_headers(backend);
         let resp = self.inner
             .post(&backend.url)

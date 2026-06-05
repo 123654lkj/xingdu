@@ -60,7 +60,25 @@ impl Adapter for OpenAiAdapter {
     }
 
     fn response_to_client(&self, response: serde_json::Value, _model: &str) -> Result<OpenAIResponse, AdapterError> {
-        serde_json::from_value(response).map_err(|e| AdapterError::Serialization(e.to_string()))
+        let mut resp = response.clone();
+        // 将 reasoning_content 合并到 content（DeepSeek v4-flash 等模型）
+        if let Some(choices) = resp.get_mut("choices").and_then(|c| c.as_array_mut()) {
+            for choice in choices {
+                if let Some(msg) = choice.get_mut("message") {
+                    let reasoning = msg.get("reasoning_content").and_then(|r| r.as_str()).unwrap_or("");
+                    if !reasoning.is_empty() {
+                        let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                        let merged = if content.is_empty() {
+                            reasoning.to_string()
+                        } else {
+                            format!("{}\n{}", content, reasoning)
+                        };
+                        msg["content"] = serde_json::json!(merged);
+                    }
+                }
+            }
+        }
+        serde_json::from_value(resp).map_err(|e| AdapterError::Serialization(e.to_string()))
     }
 
     fn stream_event_to_client(&self, event: &str, _model: &str) -> Option<OpenAIStreamChunk> {
@@ -205,7 +223,7 @@ impl Adapter for AnthropicAdapter {
                 model: model.to_string(),
                 choices: vec![StreamChoice {
                     index: 0,
-                    delta: Delta { role: None, content: None },
+                    delta: Delta { role: None, content: None, tool_calls: None },
                     finish_reason: Some("stop".into()),
                 }],
             });
@@ -218,23 +236,13 @@ impl Adapter for AnthropicAdapter {
             let delta = evt.get("delta")?;
             let delta_type = delta.get("type").and_then(|v| v.as_str()).unwrap_or("");
             if delta_type == "thinking_delta" {
-                // Pass through thinking as reasoning_content
-                let thinking = delta.get("thinking").and_then(|v| v.as_str())?;
-                return Some(OpenAIStreamChunk {
-                    id: "chatcmpl-proxy".into(),
-                    object: "chat.completion.chunk".into(),
-                    created: chrono::Utc::now().timestamp(),
-                    model: model.to_string(),
-                    choices: vec![StreamChoice {
-                        index: 0,
-                        delta: Delta { role: None, content: Some(thinking.to_string()) },
-                        finish_reason: None,
-                    }],
-                });
+                // Skip thinking blocks — not for client display
+                return None;
             }
             if delta_type == "input_json_delta" {
-                // Tool call arguments streaming
+                // Tool call arguments streaming — accumulate partial JSON
                 let partial = delta.get("partial_json").and_then(|v| v.as_str())?;
+                let idx = evt.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                 return Some(OpenAIStreamChunk {
                     id: "chatcmpl-proxy".into(),
                     object: "chat.completion.chunk".into(),
@@ -244,7 +252,16 @@ impl Adapter for AnthropicAdapter {
                         index: 0,
                         delta: Delta {
                             role: None,
-                            content: Some(format!("[tool_args:{}]", partial)),
+                            content: None,
+                            tool_calls: Some(vec![ToolCallDelta {
+                                index: idx,
+                                id: None,
+                                call_type: None,
+                                function: Some(FunctionCallDelta {
+                                    name: None,
+                                    arguments: Some(partial.to_string()),
+                                }),
+                            }]),
                         },
                         finish_reason: None,
                     }],
@@ -258,7 +275,7 @@ impl Adapter for AnthropicAdapter {
                 model: model.to_string(),
                 choices: vec![StreamChoice {
                     index: 0,
-                    delta: Delta { role: None, content: Some(text.to_string()) },
+                    delta: Delta { role: None, content: Some(text.to_string()), tool_calls: None },
                     finish_reason: None,
                 }],
             })
@@ -269,6 +286,7 @@ impl Adapter for AnthropicAdapter {
                 // Tool call start
                 let name = cb.get("name")?.as_str()?;
                 let id = cb.get("id")?.as_str()?;
+                let idx = evt.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                 return Some(OpenAIStreamChunk {
                     id: "chatcmpl-proxy".into(),
                     object: "chat.completion.chunk".into(),
@@ -278,7 +296,16 @@ impl Adapter for AnthropicAdapter {
                         index: 0,
                         delta: Delta {
                             role: None,
-                            content: Some(format!("[tool_start:{}:{}]", id, name)),
+                            content: None,
+                            tool_calls: Some(vec![ToolCallDelta {
+                                index: idx,
+                                id: Some(id.to_string()),
+                                call_type: Some("function".into()),
+                                function: Some(FunctionCallDelta {
+                                    name: Some(name.to_string()),
+                                    arguments: Some("".into()),
+                                }),
+                            }]),
                         },
                         finish_reason: None,
                     }],
@@ -294,7 +321,7 @@ impl Adapter for AnthropicAdapter {
                 model: model.to_string(),
                 choices: vec![StreamChoice {
                     index: 0,
-                    delta: Delta { role: None, content: None },
+                    delta: Delta { role: None, content: None, tool_calls: None },
                     finish_reason: Some("stop".into()),
                 }],
             })

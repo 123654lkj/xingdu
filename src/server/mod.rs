@@ -67,20 +67,33 @@ fn build_backend_request(ctx: &RequestContext) -> OpenAIRequest {
     req
 }
 
-fn select_backend_by_model(model: &str) -> (BackendConfig, Arc<dyn adapter::Adapter>) {
-    let (name, url, protocol, api_key) = if model.starts_with("MiniMax") {
-        ("minimax", "https://api.minimax.chat/v1/chat/completions", "openai", std::env::var("MINIMAX_API_KEY").unwrap_or_default())
-    } else if model.starts_with("deepseek") {
-        ("deepseek", "https://api.deepseek.com/v1/chat/completions", "openai", std::env::var("DEEPSEEK_API_KEY").unwrap_or_default())
-    } else if model.starts_with("kimi") {
-        ("kimi", "https://api.kimi.com/coding/v1/messages", "anthropic", std::env::var("KIMI_API_KEY").unwrap_or_default())
-    } else if model.starts_with("mimo") {
-        ("xiaomi", "https://token-plan-cn.xiaomimimo.com/v1/chat/completions", "openai", std::env::var("MIMO_API_KEY").unwrap_or_default())
-    } else if model.starts_with("glm") {
-        ("zhipu", "https://open.bigmodel.cn/api/anthropic/v1/messages", "anthropic", std::env::var("ZHIPU_API_KEY").unwrap_or_default())
-    } else {
-        ("bailian", "https://coding.dashscope.aliyuncs.com/apps/anthropic/v1/messages", "anthropic", std::env::var("DASHSCOPE_API_KEY").unwrap_or_default())
-    };
+fn select_backend_by_model(model: &str, protocol_override: Option<&str>) -> (BackendConfig, Arc<dyn adapter::Adapter>) {
+    // 模型配置表: 模型名前缀 -> (后端名, 默认URL, 默认协议, 环境变量名)
+    let backends: Vec<(&str, &str, &str, &str, &str),
+    > = vec![
+        ("minimax", "MiniMax", "https://api.minimax.chat/v1/chat/completions", "openai", "MINIMAX_API_KEY"),
+        ("deepseek", "deepseek", "https://api.deepseek.com/v1/chat/completions", "openai", "DEEPSEEK_API_KEY"),
+        ("kimi", "kimi", "https://api.kimi.com/coding/v1/messages", "anthropic", "KIMI_API_KEY"),
+        ("mimo", "xiaomi", "https://token-plan-cn.xiaomimimo.com/v1/chat/completions", "openai", "MIMO_API_KEY"),
+        ("glm", "zhipu", "https://open.bigmodel.cn/api/paas/v4/chat/completions", "openai", "ZHIPU_API_KEY"),
+    ];
+
+    let mut matched = None;
+    for (prefix, name, url, proto, env_key) in &backends {
+        if model.to_lowercase().starts_with(prefix) {
+            matched = Some((*name, *url, *proto, *env_key));
+            break;
+        }
+    }
+
+    let (name, url, default_protocol, env_key) = matched.unwrap_or(
+        ("bailian", "https://coding.dashscope.aliyuncs.com/apps/anthropic/v1/messages", "anthropic", "DASHSCOPE_API_KEY")
+    );
+
+    // 协议选择优先级: 请求头覆盖 > 模型配置表默认
+    let protocol = protocol_override.unwrap_or(default_protocol);
+
+    let api_key = std::env::var(env_key).unwrap_or_default();
     let backend = BackendConfig {
         name: name.to_string(),
         url: url.to_string(),
@@ -119,7 +132,7 @@ async fn handle_chat_completions(
     let model_name = request.model.clone();
     tracing::info!(model = %model_name, stream = is_stream, "request received");
 
-    let (mut backend, adapter) = select_backend_by_model(&model_name);
+    let (mut backend, adapter) = select_backend_by_model(&model_name, None);
 
     let mut req_ctx = RequestContext::new(request.clone(), state.config.clone());
     state.pipeline.execute_request(&mut req_ctx).await;
@@ -162,13 +175,13 @@ async fn handle_chat_completions(
                 let stream = backend_resp.bytes_stream();
                 let model_name = backend_req.model.clone();
                 let adapter_ref = adapter.clone();
-                let stream = stream.map(move |chunk| {
+                let stream = stream.filter_map(move |chunk| {
                     let bytes = match chunk {
                         Ok(b) => b,
-                        Err(_) => return Ok::<_, Infallible>(Event::default().data("[DONE]")),
+                        Err(_) => return futures::future::ready(Some(Ok::<_, Infallible>(Event::default().data("[DONE]")))),
                     };
                     let text = String::from_utf8_lossy(&bytes);
-                    let mut last = None;
+                    let mut events = Vec::new();
                     for line in text.lines() {
                         if line.is_empty() { continue; }
                         if is_anthropic {
@@ -177,20 +190,20 @@ async fn handle_chat_completions(
                             if line.starts_with("event:") { continue; }
                             if let Some(chunk) = adapter_ref.stream_event_to_client(line, &model_name) {
                                 if let Ok(json) = serde_json::to_string(&chunk) {
-                                    last = Some(Ok::<_, Infallible>(Event::default().data(json)));
+                                    events.push(Ok::<_, Infallible>(Event::default().data(json)));
                                 }
                             }
                         } else {
                             // OpenAI backend: strip "data: " prefix and pass through
                             let cleaned = line.strip_prefix("data: ").unwrap_or(line);
                             if cleaned == "[DONE]" {
-                                last = Some(Ok::<_, Infallible>(Event::default().data("[DONE]")));
+                                events.push(Ok::<_, Infallible>(Event::default().data("[DONE]")));
                             } else {
-                                last = Some(Ok::<_, Infallible>(Event::default().data(cleaned.to_string())));
+                                events.push(Ok::<_, Infallible>(Event::default().data(cleaned.to_string())));
                             }
                         }
                     }
-                    last.unwrap_or_else(|| Ok(Event::default().data("")))
+                    futures::future::ready(if events.is_empty() { None } else { Some(events.into_iter().next().unwrap()) })
                 });
                 Sse::new(stream).into_response()
             }
