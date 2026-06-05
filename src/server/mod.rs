@@ -67,42 +67,116 @@ fn build_backend_request(ctx: &RequestContext) -> OpenAIRequest {
     req
 }
 
-fn select_backend_by_model(model: &str, protocol_override: Option<&str>) -> (BackendConfig, Arc<dyn adapter::Adapter>) {
-    // 模型配置表: 模型名前缀 -> (后端名, 默认URL, 默认协议, 环境变量名)
-    let backends: Vec<(&str, &str, &str, &str, &str),
+fn select_backend_by_model(
+    model: &str,
+    protocol_override: Option<&str>,
+    request: &OpenAIRequest,
+) -> (BackendConfig, Arc<dyn adapter::Adapter>) {
+    // 模型配置表: 模型名前缀 -> (后端名, Anthropic端点, 默认协议, 环境变量名, OpenAI端点)
+    let backends: Vec<(&str, &str, &str, &str, &str, Option<&str>)
     > = vec![
-        ("minimax", "MiniMax", "https://api.minimax.chat/v1/chat/completions", "openai", "MINIMAX_API_KEY"),
-        ("deepseek", "deepseek", "https://api.deepseek.com/v1/chat/completions", "openai", "DEEPSEEK_API_KEY"),
-        ("kimi", "kimi", "https://api.kimi.com/coding/v1/messages", "anthropic", "KIMI_API_KEY"),
-        ("mimo", "xiaomi", "https://token-plan-cn.xiaomimimo.com/v1/chat/completions", "openai", "MIMO_API_KEY"),
-        ("glm", "zhipu", "https://open.bigmodel.cn/api/paas/v4/chat/completions", "openai", "ZHIPU_API_KEY"),
+        ("minimax", "MiniMax", "https://api.minimaxi.com/anthropic/v1/messages", "anthropic", "MINIMAX_API_KEY", Some("https://api.minimaxi.com/v1/chat/completions")),
+        ("deepseek", "deepseek", "https://api.deepseek.com/anthropic/v1/messages", "anthropic", "DEEPSEEK_API_KEY", Some("https://api.deepseek.com/v1/chat/completions")),
+        ("kimi", "kimi", "https://api.kimi.com/coding/v1/messages", "anthropic", "KIMI_API_KEY", None),
+        ("mimo", "xiaomi", "https://token-plan-cn.xiaomimimo.com/v1/chat/completions", "openai", "MIMO_API_KEY", None),
+        ("glm", "zhipu", "https://open.bigmodel.cn/api/anthropic/v1/messages", "anthropic", "ZHIPU_API_KEY", Some("https://open.bigmodel.cn/api/paas/v4/chat/completions")),
     ];
 
     let mut matched = None;
-    for (prefix, name, url, proto, env_key) in &backends {
+    for (prefix, name, url, proto, env_key, alt_url) in &backends {
         if model.to_lowercase().starts_with(prefix) {
-            matched = Some((*name, *url, *proto, *env_key));
+            matched = Some((*name, *url, *proto, *env_key, *alt_url));
             break;
         }
     }
 
-    let (name, url, default_protocol, env_key) = matched.unwrap_or(
-        ("bailian", "https://coding.dashscope.aliyuncs.com/apps/anthropic/v1/messages", "anthropic", "DASHSCOPE_API_KEY")
+    let (name, default_url, default_protocol, env_key, alt_url) = matched.unwrap_or(
+        ("bailian", "https://coding.dashscope.aliyuncs.com/apps/anthropic/v1/messages", "anthropic", "DASHSCOPE_API_KEY", Some("https://coding.dashscope.aliyuncs.com/v1/chat/completions"))
     );
 
-    // 协议选择优先级: 请求头覆盖 > 模型配置表默认
-    let protocol = protocol_override.unwrap_or(default_protocol);
+    // 智能协议选择
+    // 优先级: 请求头覆盖 > 请求特征 > 模型默认
+    let protocol = if let Some(override_proto) = protocol_override {
+        override_proto.to_string()
+    } else {
+        // 根据请求特征选择最优协议
+        select_optimal_protocol(name, default_protocol, alt_url, request)
+    };
+
+    // 根据协议选择端点
+    // default_url 是 Anthropic 端点，alt_url 是 OpenAI 端点（如果有的话）
+    let url = if protocol == "anthropic" {
+        default_url
+    } else if let Some(openai_url) = alt_url {
+        openai_url
+    } else {
+        default_url
+    };
 
     let api_key = std::env::var(env_key).unwrap_or_default();
     let backend = BackendConfig {
         name: name.to_string(),
         url: url.to_string(),
-        protocol: Protocol::from_str(protocol),
+        protocol: Protocol::from_str(&protocol),
         api_key: api_key.to_string(),
         model: model.to_string(),
     };
     let adapter = adapter::create_adapter(&backend.protocol);
     (backend, adapter)
+}
+
+/// 根据请求特征选择最优协议
+fn select_optimal_protocol(
+    backend_name: &str,
+    default_protocol: &str,
+    alt_url: Option<&str>,
+    request: &OpenAIRequest,
+) -> String {
+    // 如果没有替代端点，只能用默认
+    if alt_url.is_none() {
+        return default_protocol.to_string();
+    }
+
+    let has_tools = request.tools.is_some();
+    let _has_stream = request.stream.unwrap_or(false);
+
+    match backend_name {
+        "bailian" => {
+            // 百炼双协议都支持tools/thinking
+            // Anthropic协议thinking更标准，默认用A
+            // 但流式+tools时O协议更好
+            if has_tools {
+                "openai".to_string()
+            } else {
+                "anthropic".to_string()
+            }
+        }
+        "deepseek" => {
+            // DeepSeek双协议都支持tools/thinking
+            // OpenAI是原生协议，默认用O
+            "openai".to_string()
+        }
+        "zhipu" => {
+            // GLM双协议
+            // Anthropic: chat正常，无thinking
+            // OpenAI: thinking有，chat空(只有reasoning)
+            // 有tools → OpenAI
+            // 普通chat → Anthropic
+            if has_tools {
+                "openai".to_string()
+            } else {
+                "anthropic".to_string()
+            }
+        }
+        "minimax" => {
+            // MiniMax双协议
+            // OpenAI: chat正常，有thinking
+            // Anthropic: chat空(只有thinking)
+            // 默认用OpenAI
+            "openai".to_string()
+        }
+        _ => default_protocol.to_string(),
+    }
 }
 
 async fn handle_chat_completions(
@@ -130,9 +204,14 @@ async fn handle_chat_completions(
 
     let is_stream = request.stream.unwrap_or(false);
     let model_name = request.model.clone();
-    tracing::info!(model = %model_name, stream = is_stream, "request received");
+    
+    // 读取 X-Protocol 请求头
+    let protocol_override = headers.get("x-protocol")
+        .and_then(|v| v.to_str().ok());
+    
+    tracing::info!(model = %model_name, stream = is_stream, protocol = ?protocol_override, "request received");
 
-    let (mut backend, adapter) = select_backend_by_model(&model_name, None);
+    let (mut backend, adapter) = select_backend_by_model(&model_name, protocol_override, &request);
 
     let mut req_ctx = RequestContext::new(request.clone(), state.config.clone());
     state.pipeline.execute_request(&mut req_ctx).await;
